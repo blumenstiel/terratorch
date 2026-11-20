@@ -153,11 +153,19 @@ def _get_backbone(backbone: str | nn.Module, **backbone_kwargs) -> nn.Module:
     n_timestamps = backbone_kwargs.pop("temporal_n_timestamps", None)
     features_permute_op = backbone_kwargs.pop("temporal_features_permute_op", None)
     subset_lengths = backbone_kwargs.pop("temporal_subset_lengths", None)
+    patch_resize = backbone_kwargs.pop("patch_resize", None)
+    # native patch size: patch_resize_native (not passed to the model), else patch_size (passed on), else 16
+    patch_resize_native = backbone_kwargs.pop("patch_resize_native", None) or backbone_kwargs.get("patch_size") or 16
+    patch_resize_interpolation = backbone_kwargs.pop("patch_resize_interpolation", "bilinear")
 
     if isinstance(backbone, nn.Module):
         model = backbone
     else:
         model = BACKBONE_REGISTRY.build(backbone, **backbone_kwargs)
+
+    # FlexiViT-style effective patch size; inside the TemporalWrapper, so it resizes each time step
+    if patch_resize is not None:
+        model = PatchResize(model, patch_resize, patch_resize_native, patch_resize_interpolation)
 
     # Apply TemporalWrapper inside _get_backbone
     if use_temporal:
@@ -171,6 +179,59 @@ def _get_backbone(backbone: str | nn.Module, **backbone_kwargs) -> nn.Module:
         )
 
     return model
+
+
+class PatchResize(nn.Module):
+    """FlexiViT-style flexible patch size for any backbone, by resizing its input.
+
+    Resizes the input so that one native patch of the backbone covers ``patch_size`` input pixels,
+    the way OlmoEarth's ``FlexiPatchEmbed`` (after FlexiViT, Beyer et al. 2023,
+    https://arxiv.org/abs/2212.08013) handles a requested patch size other than its base one. The
+    pretrained patch embedding is used unchanged. Use it for backbones whose patch size is fixed by
+    the checkpoint: TerraMind ignores ``patch_size``, and Prithvi drops its pretrained patch embedding
+    when the kernel shape changes. E.g. ``patch_size=8`` with ``native_patch_size=16`` resizes a
+    256 px input to 512 px, giving a 32 x 32 token grid.
+
+    Only the backbone input is resized; labels keep their resolution and the decoder upsamples to it
+    as usual. Set it from a model config with ``backbone_patch_resize: 8``. The native patch size is
+    ``backbone_patch_resize_native`` if given (not passed to the backbone), else ``backbone_patch_size``
+    (also passed to the backbone, as usual), else 16.
+
+    Args:
+        encoder: The wrapped backbone. Its ``out_channels`` are passed through.
+        patch_size: Effective patch size in input pixels.
+        native_patch_size: Patch size the backbone tokenizes at.
+        interpolation: ``F.interpolate`` mode.
+    """
+
+    def __init__(
+        self, encoder: nn.Module, patch_size: int, native_patch_size: int = 16, interpolation: str = "bilinear"
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.patch_size = patch_size  # used by the model factories to pad inputs
+        self.scale = native_patch_size / patch_size
+        self.interpolation = interpolation
+        self.out_channels = encoder.out_channels
+
+    def _resize(self, x: torch.Tensor) -> torch.Tensor:
+        """Resize the last two dims, for inputs of any rank, e.g. (B, C, T, H, W)."""
+        h, w = x.shape[-2:]
+        size = (round(h * self.scale), round(w * self.scale))
+        flat = nn.functional.interpolate(x.reshape(-1, 1, h, w), size=size, mode=self.interpolation)
+        return flat.reshape(*x.shape[:-2], *size)
+
+    def freeze(self) -> None:
+        """Freeze the wrapped encoder, using its own ``freeze`` if it has one (e.g. Prithvi with VPT)."""
+        if hasattr(self.encoder, "freeze"):
+            self.encoder.freeze()
+        else:
+            self.encoder.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor | dict[str, torch.Tensor], *args, **kwargs):
+        if self.scale != 1:
+            x = {k: self._resize(v) for k, v in x.items()} if isinstance(x, dict) else self._resize(x)
+        return self.encoder(x, *args, **kwargs)
 
 
 class TemporalWrapper(nn.Module):
@@ -188,7 +249,8 @@ class TemporalWrapper(nn.Module):
 
         Args:
             encoder (nn.Module): The feature extractor (backbone).
-            pooling (str): Type of pooling ('keep', 'concat', 'mean', 'max', 'diff'), 'diff' requires exactly two temporal elements after optional subset aggregation.
+            pooling (str): Type of pooling ('keep', 'concat', 'mean', 'max', 'diff', 'linear', 'conv'), see\n                ``terratorch.models.necks.TemporalPooling``. 'diff' requires exactly two temporal elements after optional\n                subset aggregation; 'linear' and 'conv' are learned and need ``n_timestamps``;
+                they stay trainable with ``freeze_backbone`` (see ``freeze``).
             concat (bool): Deprecated - 'concat' now integrated as pooling option.
             n_timestamps (int): Used to compute backbone out_channels when constructing encoder–decoder pipelines in case of 'concat' pooling.
             features_permute_op (list): Permutation operation to perform on the features before aggregation.
@@ -207,29 +269,24 @@ class TemporalWrapper(nn.Module):
                 "'concat' is deprecated in TemporalWrapper. Use pooling='concat' instead.", DeprecationWarning
             )
 
-        # Check supported pooling modes
-        supported_poolings = ["mean", "max", "diff", "keep", "concat"]
-        if pooling not in supported_poolings:
-            raise ValueError(f"Unsupported pooling '{pooling}', choose from {supported_poolings}.")
+        from terratorch.models.necks import TemporalPooling
+
+        # Learned poolings need the encoder's channels per time step to size their weights.
+        learned = pooling in ("linear", "conv")
+        if learned and not (hasattr(encoder, "out_channels") and n_timestamps):
+            msg = f"'{pooling}' pooling needs n_timestamps and an encoder with out_channels."
+            raise ValueError(msg)
+        self.temporal_pooling = TemporalPooling(
+            [c * n_timestamps for c in encoder.out_channels] if learned else [],
+            n_timestamps=n_timestamps,
+            pooling=pooling,
+            subset_lengths=subset_lengths,
+        )
 
         self.encoder = encoder
         self.pooling = pooling
         self.features_permute_op = features_permute_op
         self.subset_lengths = subset_lengths
-
-        # Validate subset_lengths defines two subsets for diff pooling and matches n_timestamps if set
-        if subset_lengths is not None:
-            if pooling == "diff" and len(subset_lengths) != 2:
-                raise ValueError(
-                    f"`diff` pooling requires exactly two subsets in `subset_lengths`, "
-                    f"but got {len(subset_lengths)}: {subset_lengths}"
-                )
-
-            if n_timestamps is not None and sum(subset_lengths) != n_timestamps:
-                raise ValueError(
-                    f"The sum of `subset_lengths` must equal `n_timestamps` "
-                    f"(got sum={sum(subset_lengths)}, n_timestamps={n_timestamps})."
-                )
 
         # Precompute reverse permutation for restoring original dims after processing
         if features_permute_op is not None:
@@ -253,41 +310,17 @@ class TemporalWrapper(nn.Module):
             else:
                 self.out_channels = encoder.out_channels
 
-    def pool_temporal(self, stacked: torch.Tensor, pooling: str, subset_lengths: list[int] | None):
-        """
-        Pool per-timestep outputs based on the specified pooling method.
-        """
-
-        T = stacked.shape[1]  # number of timesteps
-
-        if subset_lengths is not None:
-            if sum(subset_lengths) != T:
-                raise ValueError(f"Sum of `subset_lengths` ({sum(subset_lengths)}) must equal timesteps ({T}).")
-
-            # Split into subsets and average within each
-            subset_splits = torch.split(stacked, subset_lengths, dim=1)
-            stacked = torch.stack([subset.mean(dim=1) for subset in subset_splits], dim=1)
-
-        if pooling == "concat":
-            return stacked.flatten(1, 2)  # concat over time: [B, T*C, H, W]
-
-        elif pooling == "max":
-            return torch.max(stacked, dim=1).values  # max over time: [B, C, H, W]
-
-        elif pooling == "diff":
-            if stacked.shape[1] != 2:
-                raise ValueError(
-                    f"`diff` pooling requires exactly two temporal elements "
-                    f"(from input or after subset aggregation), got {stacked.shape[1]}. "
-                    f"Consider to use `subset_lengths` to define two subsets."
-                )
-            return stacked[:, 0] - stacked[:, 1]  # difference between two timesteps: [B, C, H, W]
-
-        elif pooling == "mean":
-            return torch.mean(stacked, dim=1)  # mean over time: [B, C, H, W]
-
+    def freeze(self) -> None:
+        """Freeze the wrapped encoder only. The learned temporal pooling ('linear', 'conv') stays trainable,
+        like a neck, so ``freeze_backbone`` trains it on top of a frozen encoder."""
+        if hasattr(self.encoder, "freeze"):
+            self.encoder.freeze()
         else:
-            return stacked  # "keep": return [B, T, C, H, W] sequence
+            self.encoder.requires_grad_(False)
+
+    def pool_temporal(self, stacked: torch.Tensor, level: int = 0) -> torch.Tensor:
+        """Pool per-timestep outputs [B, T, C, ...] over T, see ``TemporalPooling``."""
+        return self.temporal_pooling.pool(stacked, level=level, dim=1)
 
     def reshape_5d(self, tensor: torch.Tensor, B: int, T: int) -> torch.Tensor:
         """
@@ -358,7 +391,7 @@ class TemporalWrapper(nn.Module):
         outputs = []
 
         # Postprocess each feature map returned by encoder (layer outputs)
-        for feature_map in feat:
+        for level, feature_map in enumerate(feat):
             if isinstance(feature_map, dict):  # multimodal output
                 mod_keys = feature_map.keys()
                 pooled = {}
@@ -370,7 +403,7 @@ class TemporalWrapper(nn.Module):
                     mod_stacked = self.reshape_5d(feature_map[k], B, T)
 
                     # Temporal pooling
-                    pooled[k] = self.pool_temporal(mod_stacked, self.pooling, self.subset_lengths)
+                    pooled[k] = self.pool_temporal(mod_stacked, level)
 
                     # Reverse permutation to restore original dim order
                     pooled[k] = self.permute_op(pooled[k], self.reverse_permute_op)
@@ -382,7 +415,7 @@ class TemporalWrapper(nn.Module):
             else:  # single-modality feature map
                 feature_map = self.permute_op(feature_map, self.features_permute_op)
                 stacked = self.reshape_5d(feature_map, B, T)
-                pooled = self.pool_temporal(stacked, self.pooling, self.subset_lengths)
+                pooled = self.pool_temporal(stacked, level)
                 pooled = self.permute_op(pooled, self.reverse_permute_op)
 
                 if pooled.shape[-1] == 1:
