@@ -1,6 +1,7 @@
 # reference torchgeo https://torchgeo.readthedocs.io/en/latest/_modules/torchgeo/models/dofa.html#DOFA
 import logging
 import math
+import warnings
 from collections.abc import Callable
 from functools import partial
 from typing import List
@@ -14,6 +15,8 @@ from torchvision.models._api import Weights, WeightsEnum
 
 from terratorch.registry import TERRATORCH_BACKBONE_REGISTRY
 
+# SAR bands use 3.75, the placeholder wavelength DOFA v1 was pretrained with for Sentinel-1
+# (DOFA pretraining/datasets/waves.json), not the physical C-band wavelength (5.405 cm).
 waves_list = {
     "COASTAL_AEROSOL": 0.44,
     "BLUE": 0.49,
@@ -30,13 +33,13 @@ waves_list = {
     "SWIR_2": 2.20,
     "THERMAL_INFRARED_1": 10.90,
     "THERMAL_INFRARED_12": 12.00,
-    "VV": 5.405,
-    "VH": 5.405,
-    "ASC_VV": 5.405,
-    "ASC_VH": 5.405,
-    "DSC_VV": 5.405,
-    "DSC_VH": 5.405,
-    "VV-VH": 5.405,
+    "VV": 3.75,
+    "VH": 3.75,
+    "ASC_VV": 3.75,
+    "ASC_VH": 3.75,
+    "DSC_VV": 3.75,
+    "DSC_VH": 3.75,
+    "VV-VH": 3.75,
 }
 
 
@@ -223,6 +226,20 @@ def dofa_large_patch16_224(
     return DOFAEncoderWrapper(model, wavelengths, weights, out_indices)
 
 
+def _resize_checkpoint_pos_embed(checkpoint_model: dict, state_dict: dict, input_size: int, patch_size: int, mode: str):
+    """Resize the checkpoint's pos_embed in place to the model's grid (input_size // patch_size)."""
+    if "pos_embed" not in checkpoint_model or checkpoint_model["pos_embed"].shape == state_dict["pos_embed"].shape:
+        return
+    logging.info("Resizing pos_embed from pretrained checkpoint")
+    pos_size = int(math.sqrt(checkpoint_model["pos_embed"].shape[1] - 1))
+    checkpoint_model["pos_embed"] = resize_pos_embed(
+        pos_embed=checkpoint_model["pos_embed"],
+        input_shpae=(input_size // patch_size, input_size // patch_size),
+        pos_shape=(pos_size, pos_size),
+        mode=mode,
+    )
+
+
 def load_dofa_weights(
     model: nn.Module,
     mode: str,
@@ -235,38 +252,26 @@ def load_dofa_weights(
     print("Loading weights")
     if ckpt_data is not None:
         if ckpt_data.find("https://hf.co/") > -1:
-            repo_id = ckpt_data.split("/resolve/")[0].replace("https://hf.co/", "")
-            filename = ckpt_data.split("/")[-1]
-            ckpt_data = huggingface_hub.hf_hub_download(repo_id=repo_id, filename=filename)
+            # https://hf.co/<repo_id>/resolve/<revision>/<filename>
+            repo_id, rest = ckpt_data.replace("https://hf.co/", "").split("/resolve/")
+            revision, filename = rest.split("/", 1)
+            ckpt_data = huggingface_hub.hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
         checkpoint_model = torch.load(ckpt_data, map_location="cpu", weights_only=True)
 
         for k in ["head.weight", "head.bias"]:
             if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
                 logging.info(f"Removing key {k} from pretrained checkpoint")
                 del checkpoint_model[k]
-        if input_size != 224:
-            if "pos_embed" in checkpoint_model and checkpoint_model["pos_embed"].shape != state_dict["pos_embed"].shape:
-                logging.info("Resizing pos_embed from pretrained checkpoint")
-                h, w = input_size, input_size
-                pos_size = int(math.sqrt(checkpoint_model["pos_embed"].shape[1] - 1))
-                checkpoint_model["pos_embed"] = resize_pos_embed(
-                    pos_embed=checkpoint_model["pos_embed"],
-                    input_shpae=(h // patch_size, w // patch_size),
-                    pos_shape=(pos_size, pos_size),
-                    mode=mode,
-                )
-
+        _resize_checkpoint_pos_embed(checkpoint_model, state_dict, input_size, patch_size, mode)
         msg = model.load_state_dict(checkpoint_model, strict=False)
 
         logging.info(msg)
     elif weights is not None:
         checkpoint_model = weights.get_state_dict(progress=True, weights_only=True)
         allowed_missing_keys = {"fc_norm.weight", "fc_norm.bias", "head.weight", "head.bias"}
-        if input_size != 224:
-            if "pos_embed" in checkpoint_model and checkpoint_model["pos_embed"].shape != state_dict["pos_embed"].shape:
-                logging.info("Removing key pos_embed from pretrained checkpoint")
-                del checkpoint_model["pos_embed"]
-                allowed_missing_keys.add("pos_embed")
+        # The model's own pos_embed is all zeros (torchgeo does not initialize it), so the pretrained one must be
+        # resized, not dropped.
+        _resize_checkpoint_pos_embed(checkpoint_model, state_dict, input_size, patch_size, mode)
         missing_keys, unexpected_keys = model.load_state_dict(checkpoint_model, strict=False)
         logging.info("Weights loaded.")
         # Both fc_norm and head are generated dynamically
