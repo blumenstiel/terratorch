@@ -94,6 +94,7 @@ nav:
       - TerraMind: guide/terramind.md
       - Prithvi EO: guide/prithvi_eo.md
       - OlmoEarth: guide/olmoearth.md
+      - DOFA: guide/dofa.md
       - Temporal Wrapper: guide/temporal_wrapper.md
 # TODO Add guide for a general approach to a new use case
 #    - New Use Case: guide/new_use_case.md
