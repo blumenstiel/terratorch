@@ -285,17 +285,18 @@ class TestClay1_5ModelFactory:
                 **kwargs,
             )
 
-    def test_missing_metadata_raises(self, factory):
+    def test_missing_metadata_uses_clay_metadata(self, factory):
         kwargs = {k: v for k, v in BASE_FACTORY_KWARGS.items() if k != "metadata"}
-        with pytest.raises(ValueError, match="metadata"):
-            factory.build_model(
-                task="segmentation",
-                backbone="clay15",
-                decoder="FCNDecoder",
-                in_channels=4,
-                num_classes=10,
-                **kwargs,
-            )
+        model = factory.build_model(
+            task="segmentation",
+            backbone="clay15",
+            decoder="FCNDecoder",
+            in_channels=4,
+            num_classes=10,
+            **kwargs,
+        )
+        assert model.encoder.metadata.naip.gsd == 1.0
+        assert model(torch.randn(1, 4, 64, 64)).output.shape == (1, 10, 64, 64)
 
     def test_platform_not_in_metadata_raises(self, factory):
         with pytest.raises(KeyError):
@@ -467,17 +468,33 @@ class TestCheckpointLoading:
         with pytest.raises(FileNotFoundError, match="Checkpoint not found"):
             _resolve_checkpoint("/nonexistent/path/model.ckpt")
 
-    def test_load_encoder_weights_wrong_prefix_warns(self, tmp_path, caplog):
-        import logging
+    def test_load_encoder_weights_wrong_prefix_raises(self, tmp_path):
         from terratorch.models.clay1_5_model_factory import _load_encoder_weights
         # Checkpoint with wrong key prefix — no "model.encoder." keys
         fake_state = {"encoder.some_weight": torch.zeros(4)}
         ckpt_path = tmp_path / "wrong_prefix.ckpt"
         torch.save({"state_dict": fake_state}, str(ckpt_path))
-        encoder = _make_encoder()
-        with caplog.at_level(logging.WARNING, logger="terratorch"):
-            _load_encoder_weights(encoder, str(ckpt_path))
-        assert "NOT loaded" in caplog.text
+        with pytest.raises(KeyError, match="model.encoder."):
+            _load_encoder_weights(_make_encoder(), str(ckpt_path))
+
+    def test_load_encoder_weights_wrong_depth_raises(self, tmp_path):
+        from terratorch.models.clay1_5_model_factory import _load_encoder_weights
+        deeper = Encoder(mask_ratio=0.75, shuffle=False, **{**TINY_ENCODER_KWARGS, "depth": 3})
+        ckpt_path = tmp_path / "deeper.ckpt"
+        torch.save({"state_dict": {f"model.encoder.{k}": v for k, v in deeper.state_dict().items()}}, str(ckpt_path))
+        with pytest.raises(RuntimeError, match="Unexpected key"):
+            _load_encoder_weights(_make_encoder(), str(ckpt_path))
+
+    def test_resolve_checkpoint_download_failure_raises(self, monkeypatch):
+        import huggingface_hub
+        from terratorch.models.clay1_5_model_factory import _resolve_checkpoint
+
+        def offline(*args, **kwargs):
+            raise OSError("offline")
+
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", offline)
+        with pytest.raises(RuntimeError, match="checkpoint"):
+            _resolve_checkpoint(None)
 
     def test_load_encoder_weights_correct_prefix(self, tmp_path, caplog):
         import logging
@@ -492,6 +509,75 @@ class TestCheckpointLoading:
             _load_encoder_weights(encoder, str(ckpt_path))
         assert "NOT loaded" not in caplog.text
         assert "loaded successfully" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Registered backbone, metadata, time / latlon, non-square input, out_indices
+# ---------------------------------------------------------------------------
+
+class TestClayV15Backbone:
+    def test_registered_large_backbone(self):
+        from terratorch.registry import BACKBONE_REGISTRY
+        backbone = BACKBONE_REGISTRY.build("clay_v1_5_large", pretrained=False)
+        assert backbone.platform == "sentinel-2-l2a"
+        assert backbone.out_channels == [1024]
+        assert len(backbone.encoder_module.transformer.layers) == 24
+        assert backbone.patch_size == 8
+
+    def test_clay_metadata(self):
+        from terratorch.models.backbones.clay_v15.metadata import CLAY_METADATA
+        s2 = CLAY_METADATA["sentinel-2-l2a"]
+        assert s2["gsd"] == 10.0
+        assert list(s2["bands"]["wavelength"]) == s2["band_order"]
+        assert CLAY_METADATA["sentinel-1-rtc"]["bands"]["wavelength"] == {"vv": 3.5, "vh": 4.0}
+
+    def test_time_latlon_kwargs(self):
+        backbone = _make_backbone().eval()
+        x = torch.randn(2, 4, 32, 32)
+        zeros = torch.zeros(2, 4)
+        latlon = torch.tensor([[0.5, 0.8, -0.2, 0.9]] * 2)
+        with torch.no_grad():
+            default = backbone(x)[0]
+            assert torch.equal(default, backbone(x, time=zeros, latlon=zeros)[0])
+            assert not torch.allclose(default, backbone(x, time=zeros, latlon=latlon)[0])
+
+    def test_non_square_input(self):
+        backbone = _make_backbone().eval()
+        out = backbone(torch.randn(1, 4, 32, 64))
+        assert out[0].shape == (1, TINY_ENCODER_KWARGS["dim"], 4, 8)
+
+    def test_non_square_matches_square_crop(self):
+        # Row-major patch order: the top-left 4x4 patches of a 4x8 grid get the same position encoding as a 4x4 grid
+        encoder = _make_encoder()
+        patches = torch.zeros(1, 32, TINY_ENCODER_KWARGS["dim"])
+        gsd = torch.tensor(1.0)
+        wide = encoder.add_encodings(patches, torch.zeros(1, 4), torch.zeros(1, 4), gsd, grid=(4, 8))
+        square = encoder.add_encodings(patches[:, :16], torch.zeros(1, 4), torch.zeros(1, 4), gsd)
+        assert torch.equal(wide.reshape(1, 4, 8, -1)[:, :, :4].reshape(1, 16, -1), square)
+
+    def test_out_indices(self):
+        encoder = _make_encoder()
+        default = ClayMAEBackbone(encoder, "naip", Box(NAIP_METADATA)).eval()
+        multi = ClayMAEBackbone(encoder, "naip", Box(NAIP_METADATA), out_indices=[0, -1]).eval()
+        assert multi.out_channels == [TINY_ENCODER_KWARGS["dim"]] * 2
+        x = torch.randn(1, 4, 32, 32)
+        with torch.no_grad():
+            first, last = multi(x)
+            assert torch.equal(last, default(x)[0])
+            assert not torch.allclose(first, last)
+
+    def test_factory_out_indices_feed_decoder(self):
+        model = Clay1_5ModelFactory().build_model(
+            task="segmentation",
+            backbone="clay15",
+            decoder="UNetDecoder",
+            decoder_channels=[32, 16],
+            in_channels=4,
+            num_classes=3,
+            out_indices=[0, 1],
+            **BASE_FACTORY_KWARGS,
+        )
+        assert model(torch.randn(1, 4, 32, 32)).output.shape == (1, 3, 32, 32)
 
 
 if __name__ == "__main__":
