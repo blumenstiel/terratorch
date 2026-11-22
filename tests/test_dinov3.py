@@ -1,4 +1,5 @@
 import gc
+from pathlib import Path
 
 import pytest
 import torch
@@ -56,3 +57,47 @@ def test_model_different_img_size():
     output = model.forward(dummy_input)
     assert output[0].shape[0] == 1
     gc.collect()
+
+
+# Download-free tests against a local clone of the DINOv3 hub repo (random weights)
+HUB_DIR = Path(torch.hub.get_dir()) / "facebookresearch_dinov3_main"
+local_hub = pytest.mark.skipif(not (HUB_DIR / "hubconf.py").exists(), reason="no local DINOv3 hub repo")
+
+
+def _local(model, **kwargs):
+    return DinoV3Wrapper(model=model, repo_or_dir=str(HUB_DIR), source="local", **kwargs)
+
+
+@local_hub
+def test_cls_token_first():
+    model = _local("dinov3_vits16")
+    x = torch.randn(1, 3, 64, 64)
+    output = model(x)
+    patches, cls = model.dinov3.get_intermediate_layers(x, n=[11], return_class_token=True)[0]
+    torch.testing.assert_close(output[-1][:, 0], cls, atol=1e-4, rtol=1e-3)
+    torch.testing.assert_close(output[-1][:, 1:], patches, atol=1e-4, rtol=1e-3)
+
+
+@local_hub
+def test_out_indices_and_reshape():
+    model = _local("dinov3_vits16", out_indices=[3, 11], reshape=True)
+    output = model(torch.randn(1, 3, 64, 64))
+    assert model.out_channels == [384, 384]
+    assert [o.shape for o in output] == [torch.Size([1, 384, 4, 4])] * 2
+
+
+@local_hub
+def test_convnext_stride16_stage_map():
+    model = _local("dinov3_convnext_tiny", out_indices=[2], reshape=True)
+    output = model(torch.randn(1, 3, 64, 64))
+    assert model.out_channels == [384]
+    assert len(output) == 1
+    assert output[0].shape == (1, 384, 4, 4)
+
+
+@local_hub
+def test_kwargs_forwarded_to_hub():
+    # ConvNeXt patch_size resizes every stage to the H/16 grid; factories also pass pretrained and img_size
+    model = _local("dinov3_convnext_tiny", return_cls_token=False, patch_size=16, pretrained=True, img_size=64)
+    output = model(torch.randn(1, 3, 64, 64))
+    assert [o.shape[1] for o in output] == [16] * 4
