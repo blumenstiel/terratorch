@@ -44,6 +44,8 @@ def _cfg(**kwargs):
         "decoder_depth": 8,
         "decoder_num_heads": 16,
         "mlp_ratio": 4,
+        # Pretraining statistics for reference only: the model does not normalize its inputs,
+        # apply (x - mean) / std in the data pipeline.
         "mean": PRITHVI_V2_MEAN,
         "std": PRITHVI_V2_STD,
         "coords_encoding": [],
