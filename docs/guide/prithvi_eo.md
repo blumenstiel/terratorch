@@ -23,6 +23,11 @@ Models with the `_tl` suffix support additional time and location metadata input
 These models were pre-trained on the following bands:
 `BLUE`, `GREEN`, `RED`, `NIR_NARROW`, `SWIR_1`, `SWIR_2`
 
+The backbone does **not** normalize its inputs. Standardize them in the data pipeline with the pretraining
+statistics (HLS reflectance x 10000, band order as above), available as `PRITHVI_V2_MEAN` / `PRITHVI_V2_STD`
+(`PRITHVI_V1_MEAN` / `PRITHVI_V1_STD` for `prithvi_eo_v1_100`) in `terratorch.models.backbones.prithvi_vit`.
+The `mean` and `std` entries in `prithvi_cfgs` are the same values and are not applied by the model.
+
 ## Usage
 
 You can build the backbone using the `BACKBONE_REGISTRY`.  
@@ -113,6 +118,15 @@ Full example: [burn\_scars.yaml](https://github.com/IBM/terratorch/blob/main/exa
 ### Metadata Inputs
 
 Metadata is optional and supported only by `_tl` models. During pre-training, metadata was dropped in 10% of the samples, so the model is robust to missing metadata.
+
+`temporal_coords` must have one entry per input frame (`T` of the input tensor). `T` may differ from `num_frames`.
+
+!!! note
+    The time and location encodings are added with a learned scale. In the released checkpoints the encoder's
+    time scale converged to almost zero (`prithvi_eo_v2_tiny_tl`: -1.7e-6, `prithvi_eo_v2_100_tl`: -1.1e-4,
+    `prithvi_eo_v2_300_tl`: 1.3e-6), so `temporal_coords` barely change the features: on random 4-frame inputs,
+    passing them changes the last-layer output of the 100M / 300M models by about 3e-5 / 1e-6 (relative L2).
+    The location scale is 0.075 (100M) and 0.058 (300M), but only 2.8e-5 for the tiny model.
 
 Specify metadata usage with:
 

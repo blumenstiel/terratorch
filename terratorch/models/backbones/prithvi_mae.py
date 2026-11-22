@@ -445,7 +445,7 @@ class PrithviViT(nn.Module):
         x = x + pos_embed[:, 1:, :]
 
         if self.temporal_encoding and temporal_coords is not None:
-            num_tokens_per_frame = x.shape[1] // self.num_frames
+            num_tokens_per_frame = x.shape[1] // temporal_coords.shape[1]
             temporal_encoding = self.temporal_embed_enc(temporal_coords, num_tokens_per_frame)
             x = x + temporal_encoding
         if self.location_encoding and location_coords is not None:
@@ -492,6 +492,8 @@ class PrithviViT(nn.Module):
             # add time dim
             x = x.unsqueeze(2)
         sample_shape = x.shape[-3:]
+        # Token grid (t, h, w) of this input, used by prepare_features_for_image_model
+        self._feature_grid = [s // p for s, p in zip(sample_shape, self.patch_embed.patch_size)]
 
         # embed patches
         x = self.patch_embed(x)
@@ -501,7 +503,7 @@ class PrithviViT(nn.Module):
         x = x + pos_embed[:, 1:, :]
 
         if self.temporal_encoding and temporal_coords is not None:
-            num_tokens_per_frame = x.shape[1] // self.num_frames
+            num_tokens_per_frame = x.shape[1] // temporal_coords.shape[1]
             temporal_encoding = self.temporal_embed_enc(temporal_coords, num_tokens_per_frame)
             x = x + temporal_encoding
         if self.location_encoding and location_coords is not None:
@@ -540,19 +542,9 @@ class PrithviViT(nn.Module):
 
     def prepare_features_for_image_model(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
         out = []
-        effective_time_dim = self.patch_embed.input_size[0] // self.patch_embed.patch_size[0]
+        t, h, w = getattr(self, "_feature_grid", self.patch_embed.grid_size)
         for x in features:
-            x_no_token = x[:, 1:, :]
-            number_of_tokens = x_no_token.shape[1]
-            tokens_per_timestep = number_of_tokens // effective_time_dim
-            h = int(np.sqrt(tokens_per_timestep))
-            encoded = rearrange(
-                x_no_token,
-                "batch (t h w) e -> batch (t e) h w",
-                e=self.embed_dim,
-                t=effective_time_dim,
-                h=h,
-            )
+            encoded = rearrange(x[:, 1:, :], "batch (t h w) e -> batch (t e) h w", t=t, h=h, w=w)
             out.append(encoded)
         return out
 
@@ -661,7 +653,7 @@ class MAEDecoder(nn.Module):
         x = x + decoder_pos_embed[:, 1:, :]
 
         if self.temporal_encoding and temporal_coords is not None:
-            num_tokens_per_frame = x.shape[1] // self.num_frames
+            num_tokens_per_frame = x.shape[1] // temporal_coords.shape[1]
             temporal_encoding = self.temporal_embed_dec(temporal_coords, num_tokens_per_frame)
             # Add temporal encoding w/o cls token
             x = x + temporal_encoding
