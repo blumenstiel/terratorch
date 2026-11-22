@@ -60,17 +60,17 @@ class Encoder(nn.Module):
         patches, waves_encoded = self.patch_embedding(cube, waves)  # [B L D]
         return patches, waves_encoded  # ([B L D], [N D])
 
-    def add_encodings(self, patches, time, latlon, gsd):
-        """Add position encoding to the patches"""
+    def add_encodings(self, patches, time, latlon, gsd, grid=None):
+        """Add position encoding to the patches. `grid` is the (h, w) patch grid, square if None."""
         B, L, D = patches.shape
 
-        grid_size = int(math.sqrt(L))
-        self.num_patches = grid_size**2
+        h, w = grid if grid is not None else (int(math.sqrt(L)),) * 2
+        self.num_patches = h * w
 
         pos_encoding = (
             posemb_sincos_2d_with_gsd(
-                h=grid_size,
-                w=grid_size,
+                h=h,
+                w=w,
                 dim=(self.dim - 8),
                 gsd=gsd,
             )
@@ -168,6 +168,7 @@ class Encoder(nn.Module):
             time,
             latlon,
             gsd,
+            grid=(H // self.patch_size, W // self.patch_size),
         )  # [B L D] - add position encoding to the embeddings
 
         # mask out patches
