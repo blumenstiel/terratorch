@@ -47,6 +47,10 @@
     options:
         toc_label: "TorchGeo Swin Satlas"
 
+:::terratorch.models.backbones.torchgeo_deo
+    options:
+        toc_label: "TorchGeo DEO"
+
 :::terratorch.models.backbones.heliofm_register.heliofm_backbone_surya
     options:
         toc_label: "Surya"
