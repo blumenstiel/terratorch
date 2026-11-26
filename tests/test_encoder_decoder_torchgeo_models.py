@@ -195,3 +195,18 @@ def test_create_pixelwise_model_swin(backbone, task, expected, decoder, model_fa
         assert model(model_input).output.shape == expected
 
     gc.collect()
+
+
+@pytest.mark.parametrize("channels", [10, 3])
+@pytest.mark.parametrize("task,expected", PIXELWISE_TASK_EXPECTED_OUTPUT)
+def test_create_pixelwise_model_deo(channels, task, expected, model_factory: EncoderDecoderFactory):
+    model = model_factory.build_model(
+        task, backbone="deo_swin_b", decoder="UperNetDecoder", backbone_pretrained=False,
+        num_classes=NUM_CLASSES if task == "segmentation" else None,
+    )
+    model.eval()
+
+    with torch.no_grad():
+        assert model(torch.ones((1, channels, 224, 224))).output.shape == expected
+
+    gc.collect()
